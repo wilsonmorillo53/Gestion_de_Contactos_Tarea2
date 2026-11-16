@@ -1,5 +1,9 @@
 package vista;
 
+import controlador.BusquedaContactoTask;      // Unidad 3: búsqueda con Thread
+import controlador.BusquedaExecutorTask;       // Unidad 3: búsqueda con ExecutorService
+import controlador.NotificacionTask;           // Unidad 3: avisos con Thread
+import controlador.ValidacionContactoTask;     // Unidad 3: validación con Thread
 import modelo.Contacto;
 import modelo.ContactoDAO;
 import util.ExportadorCSV;
@@ -22,7 +26,6 @@ import java.awt.*;
 import java.awt.event.*;
 import java.awt.geom.Path2D;
 import java.io.File;
-import java.io.IOException;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.regex.Pattern;
@@ -82,10 +85,17 @@ public class VentanaPrincipal extends JFrame implements GestorIdioma.IdiomaListe
     private final JLabel lblBuscarTexto = new JLabel();
     private final JLabel lblIconoEstado = new JLabel();
     private final JLabel lblEstado = new JLabel();
+    private final JLabel lblAviso = new JLabel();
+    private final JPanel panelAviso = new JPanel(new FlowLayout(FlowLayout.LEFT, 10, 0));
+    private final Timer ocultarAviso = new Timer(3200, e -> {
+        panelAviso.setVisible(false);
+        if (panelAviso.getParent() != null) panelAviso.getParent().repaint();
+    });
 
     private final PanelEstadisticas panelEstadisticas = new PanelEstadisticas();
 
     private int filaModeloEditando = -1;
+    private ContactoDAO.BloqueoEdicion bloqueoEdicion;
     private int mouseX, mouseY;
 
     public VentanaPrincipal() {
@@ -122,6 +132,7 @@ public class VentanaPrincipal extends JFrame implements GestorIdioma.IdiomaListe
 
         configurarVentana();
         construirInterfaz();
+        iniciarNotificaciones();
         GestorIdioma.agregarListener(this);
         idiomaCambiado(GestorIdioma.getIdiomaActual());
         actualizarEstadisticas();
@@ -132,6 +143,13 @@ public class VentanaPrincipal extends JFrame implements GestorIdioma.IdiomaListe
         setSize(880, 560);
         setMinimumSize(new Dimension(800, 500));
         setLocationRelativeTo(null);
+        // Cierra el ExecutorService al salir de la aplicación
+        addWindowListener(new java.awt.event.WindowAdapter() {
+            @Override public void windowClosing(java.awt.event.WindowEvent e) {
+                dao.desbloquearEdicion(bloqueoEdicion);
+                BusquedaExecutorTask.cerrar();
+            }
+        });
     }
 
     private void construirInterfaz() {
@@ -215,7 +233,10 @@ public class VentanaPrincipal extends JFrame implements GestorIdioma.IdiomaListe
         // Botones de ventana con trazado vectorial exacto
         JButton btnMinimizar = crearBotonVentana(0, e -> setState(JFrame.ICONIFIED));
         JButton btnMaximizar = crearBotonVentana(1, e -> toggleMaximizar());
-        JButton btnCerrar = crearBotonVentana(2, e -> System.exit(0));
+        JButton btnCerrar = crearBotonVentana(2, e -> {
+            BusquedaExecutorTask.cerrar();
+            System.exit(0);
+        });
 
         panelDer.add(btnMinimizar);
         panelDer.add(btnMaximizar);
@@ -609,15 +630,39 @@ public class VentanaPrincipal extends JFrame implements GestorIdioma.IdiomaListe
         panelBuscar.add(lblBuscarTexto);
         panelBuscar.add(txtBuscar);
 
+        // Unidad 3 – Búsqueda en segundo plano con Thread + ExecutorService
         txtBuscar.getDocument().addDocumentListener(new DocumentListener() {
-            private void filtrar() {
+            private void buscarEnSegundoPlano() {
                 String texto = txtBuscar.getText().trim();
-                sorter.setRowFilter(texto.isEmpty() ? null
-                        : RowFilter.regexFilter("(?i)" + Pattern.quote(texto)));
+
+                if (texto.isEmpty()) {
+                    // Sin texto: restaurar tabla completa en el EDT directamente
+                    sorter.setRowFilter(null);
+                    lblEstado.setText(GestorIdioma.get("status.ready"));
+                    return;
+                }
+
+                lblEstado.setText("Buscando…");
+
+                // Opción A – Thread independiente (mismo enfoque que ValidacionContactoTask)
+                new BusquedaContactoTask(dao, texto, resultados -> {
+                    modeloTabla.setRowCount(0);
+                    resultados.forEach(c -> modeloTabla.addRow(
+                            new Object[]{c.getNombre(), c.getTelefono(), c.getEmail()}));
+                    lblEstado.setText("Resultados: " + resultados.size());
+                }).ejecutar();
+
+                // Opción B – ExecutorService (cancela búsquedas anteriores si el usuario escribe rápido)
+                BusquedaExecutorTask.buscar(dao, texto, resultados -> {
+                    modeloTabla.setRowCount(0);
+                    resultados.forEach(c -> modeloTabla.addRow(
+                            new Object[]{c.getNombre(), c.getTelefono(), c.getEmail()}));
+                    lblEstado.setText("Resultados: " + resultados.size());
+                });
             }
-            @Override public void insertUpdate(DocumentEvent e) { filtrar(); }
-            @Override public void removeUpdate(DocumentEvent e) { filtrar(); }
-            @Override public void changedUpdate(DocumentEvent e) { filtrar(); }
+            @Override public void insertUpdate(DocumentEvent e)  { buscarEnSegundoPlano(); }
+            @Override public void removeUpdate(DocumentEvent e)   { buscarEnSegundoPlano(); }
+            @Override public void changedUpdate(DocumentEvent e)  { buscarEnSegundoPlano(); }
         });
 
         pie.add(panelBuscar, BorderLayout.WEST);
@@ -636,6 +681,38 @@ public class VentanaPrincipal extends JFrame implements GestorIdioma.IdiomaListe
         pie.add(panelEstado, BorderLayout.EAST);
 
         return pie;
+    }
+
+    /** El hilo de notificaciones pinta un aviso y lo retira solo. */
+    private void iniciarNotificaciones() {
+        panelAviso.setBackground(COLOR_HEADER);
+        panelAviso.setBorder(new EmptyBorder(8, 16, 8, 16));
+        panelAviso.setVisible(false);
+        lblAviso.setFont(FuenteUtil.cargarFuente(13f));
+        lblAviso.setForeground(Color.WHITE);
+        panelAviso.add(lblAviso);
+
+        JComponent cristal = new JComponent() {
+            @Override public boolean contains(int x, int y) { return false; }
+        };
+        cristal.setLayout(new BorderLayout());
+        cristal.add(panelAviso, BorderLayout.SOUTH);
+        setGlassPane(cristal);
+        cristal.setVisible(true);
+        ocultarAviso.setRepeats(false);
+
+        NotificacionTask.iniciar(mensaje -> {
+            lblAviso.setText(mensaje);
+            panelAviso.setVisible(true);
+            cristal.revalidate();
+            cristal.repaint();
+            ocultarAviso.restart();
+        });
+    }
+
+    private void avisar(String mensaje) {
+        lblEstado.setText(mensaje);
+        NotificacionTask.publicar(mensaje);
     }
 
     // =========================================================================
@@ -715,10 +792,11 @@ public class VentanaPrincipal extends JFrame implements GestorIdioma.IdiomaListe
     // =========================================================================
     // 6. ACCIONES DEL CONTROLADOR
     // =========================================================================
+    // Unidad 3 – Valida duplicados en segundo plano antes de guardar
     private void agregarContacto() {
-        String nombre = txtNombre.getText().trim();
+        String nombre   = txtNombre.getText().trim();
         String telefono = txtTelefono.getText().trim();
-        String email = txtEmail.getText().trim();
+        String email    = txtEmail.getText().trim();
 
         if (nombre.isEmpty()) {
             JOptionPane.showMessageDialog(this, GestorIdioma.get("val.name_required"),
@@ -733,15 +811,36 @@ public class VentanaPrincipal extends JFrame implements GestorIdioma.IdiomaListe
             return;
         }
 
-        Contacto contacto = new Contacto(nombre, telefono, email);
-        dao.agregar(contacto);
-        modeloTabla.addRow(new Object[]{contacto.getNombre(), contacto.getTelefono(), contacto.getEmail()});
-        limpiarFormulario();
-        actualizarEstadisticas();
-        lblEstado.setText(GestorIdioma.get("status.added"));
+        Contacto candidato = new Contacto(nombre, telefono, email);
+        btnAgregar.setEnabled(false);
+        lblEstado.setText("Validando…");
+
+        new ValidacionContactoTask(dao, candidato,
+            msg -> {                                       // onDuplicado
+                btnAgregar.setEnabled(true);
+                lblEstado.setText(GestorIdioma.get("status.ready"));
+                JOptionPane.showMessageDialog(this, msg,
+                        GestorIdioma.get("val.validation_title"), JOptionPane.WARNING_MESSAGE);
+            },
+            () -> {                                        // onValido
+                modeloTabla.addRow(new Object[]{candidato.getNombre(), candidato.getTelefono(), candidato.getEmail()});
+                limpiarFormulario();
+                actualizarEstadisticas();
+                btnAgregar.setEnabled(true);
+                avisar(GestorIdioma.get("status.added"));
+            }
+        ).ejecutar();
+    }
+
+    private Contacto contactoEnFila(int filaModelo) {
+        return new Contacto(
+                String.valueOf(modeloTabla.getValueAt(filaModelo, 0)),
+                String.valueOf(modeloTabla.getValueAt(filaModelo, 1)),
+                String.valueOf(modeloTabla.getValueAt(filaModelo, 2)));
     }
 
     private void iniciarModificacion() {
+        if (bloqueoEdicion != null) return;
         int filaVista = tabla.getSelectedRow();
         if (filaVista < 0) {
             JOptionPane.showMessageDialog(this,
@@ -751,18 +850,28 @@ public class VentanaPrincipal extends JFrame implements GestorIdioma.IdiomaListe
         }
 
         int filaModelo = tabla.convertRowIndexToModel(filaVista);
+        ContactoDAO.BloqueoEdicion bloqueo = dao.bloquearEdicion(contactoEnFila(filaModelo));
+        if (bloqueo == null) {
+            JOptionPane.showMessageDialog(this, GestorIdioma.get("val.contact_locked"),
+                    GestorIdioma.get("val.validation_title"), JOptionPane.WARNING_MESSAGE);
+            return;
+        }
+        bloqueoEdicion = bloqueo;
         filaModeloEditando = filaModelo;
-        txtNombre.setText(String.valueOf(modeloTabla.getValueAt(filaModelo, 0)));
-        txtTelefono.setText(String.valueOf(modeloTabla.getValueAt(filaModelo, 1)));
-        txtEmail.setText(String.valueOf(modeloTabla.getValueAt(filaModelo, 2)));
+        Contacto contacto = bloqueo.getContacto();
+        txtNombre.setText(contacto.getNombre());
+        txtTelefono.setText(contacto.getTelefono());
+        txtEmail.setText(contacto.getEmail());
 
         btnAgregar.setText(GestorIdioma.get("btn.save"));
+        btnModificar.setEnabled(false);
         lblEstado.setText(GestorIdioma.get("status.editing"));
         txtNombre.requestFocusInWindow();
     }
 
     private void guardarCambiosContacto() {
-        if (filaModeloEditando < 0 || filaModeloEditando >= modeloTabla.getRowCount()) {
+        if (filaModeloEditando < 0 || filaModeloEditando >= modeloTabla.getRowCount()
+                || bloqueoEdicion == null) {
             cancelarModificacion();
             return;
         }
@@ -785,7 +894,7 @@ public class VentanaPrincipal extends JFrame implements GestorIdioma.IdiomaListe
         }
 
         Contacto actualizado = new Contacto(nombre, telefono, email);
-        if (!dao.modificar(filaModeloEditando, actualizado)) {
+        if (!dao.modificar(bloqueoEdicion, actualizado)) {
             JOptionPane.showMessageDialog(this, "Error al actualizar contacto.",
                     GestorIdioma.get("val.error_title"), JOptionPane.ERROR_MESSAGE);
             cancelarModificacion();
@@ -798,12 +907,15 @@ public class VentanaPrincipal extends JFrame implements GestorIdioma.IdiomaListe
 
         cancelarModificacion();
         actualizarEstadisticas();
-        lblEstado.setText(GestorIdioma.get("status.modified"));
+        avisar(GestorIdioma.get("status.modified"));
     }
 
     private void cancelarModificacion() {
+        dao.desbloquearEdicion(bloqueoEdicion);
+        bloqueoEdicion = null;
         filaModeloEditando = -1;
         btnAgregar.setText(GestorIdioma.get("btn.add"));
+        btnModificar.setEnabled(true);
         limpiarFormulario();
         lblEstado.setText(GestorIdioma.get("status.ready"));
     }
@@ -831,13 +943,18 @@ public class VentanaPrincipal extends JFrame implements GestorIdioma.IdiomaListe
                 JOptionPane.YES_NO_OPTION);
         if (confirmar != JOptionPane.YES_OPTION) return;
 
-        dao.eliminar(filaModelo);
+        if (filaModeloEditando == filaModelo) cancelarModificacion();
+        if (!dao.eliminar(contactoEnFila(filaModelo))) {
+            JOptionPane.showMessageDialog(this, GestorIdioma.get("val.contact_locked"),
+                    GestorIdioma.get("val.validation_title"), JOptionPane.WARNING_MESSAGE);
+            return;
+        }
         modeloTabla.removeRow(filaModelo);
         if (filaModeloEditando >= 0) {
             cancelarModificacion();
         }
         actualizarEstadisticas();
-        lblEstado.setText(GestorIdioma.get("status.deleted"));
+        avisar(GestorIdioma.get("status.deleted"));
     }
 
     private void exportarCSV() {
@@ -849,21 +966,23 @@ public class VentanaPrincipal extends JFrame implements GestorIdioma.IdiomaListe
         if (!archivo.getName().toLowerCase().endsWith(".csv")) {
             archivo = new File(archivo.getParentFile(), archivo.getName() + ".csv");
         }
+        Path destino = archivo.toPath();
+        avisar(GestorIdioma.get("status.exporting"));
 
-        lblEstado.setText(GestorIdioma.get("status.exporting"));
-        try {
-            ExportadorCSV.exportar(dao.listar(), Path.of(archivo.getAbsolutePath()));
-            lblEstado.setText(GestorIdioma.get("status.exported"));
-            JOptionPane.showMessageDialog(this,
-                    GestorIdioma.get("val.export_success", archivo.getAbsolutePath()),
-                    GestorIdioma.get("val.success_title"),
-                    JOptionPane.INFORMATION_MESSAGE);
-        } catch (IOException ex) {
-            lblEstado.setText(GestorIdioma.get("status.export_error"));
-            JOptionPane.showMessageDialog(this, ex.getMessage(),
-                    GestorIdioma.get("val.error_title"),
-                    JOptionPane.ERROR_MESSAGE);
-        }
+        ExportadorCSV.exportarEnSegundoPlano(dao.listar(), destino,
+                () -> {
+                    avisar(GestorIdioma.get("status.exported"));
+                    JOptionPane.showMessageDialog(this,
+                            GestorIdioma.get("val.export_success", destino.toAbsolutePath().toString()),
+                            GestorIdioma.get("val.success_title"),
+                            JOptionPane.INFORMATION_MESSAGE);
+                },
+                error -> {
+                    avisar(GestorIdioma.get("status.export_error"));
+                    JOptionPane.showMessageDialog(this, error.getMessage(),
+                            GestorIdioma.get("val.error_title"),
+                            JOptionPane.ERROR_MESSAGE);
+                });
     }
 
     private void actualizarEstadisticas() {
